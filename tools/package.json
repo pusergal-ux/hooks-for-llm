@@ -1,0 +1,8 @@
+{
+  "name": "da-tools",
+  "private": true,
+  "description": "Node-инструменты проекта (в отличие от src/*.py, требующих tools/requirements.txt).",
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "11.17.0"
+  }
+}
