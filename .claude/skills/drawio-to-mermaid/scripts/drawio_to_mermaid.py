@@ -555,7 +555,11 @@ def render_json(shapes: dict, edges: list) -> str:
 # --------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # консоль Windows по умолчанию не UTF-8 — кириллица в выводе ломается
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+    parser =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("drawio_file", help="Путь к .drawio/.xml файлу")
     parser.add_argument("--threshold", type=float, default=30.0,
                          help="Радиус поиска ближайшей фигуры к концу несвязанной линии, px (по умолчанию 30)")
