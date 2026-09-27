@@ -223,6 +223,9 @@ Claude Code подхватывает скилл в новой сессии и в
    `source`/`target` как есть, а для стрелок, которые автор лишь подвёл к фигуре,
    ищет ближайшую фигуру по координатам. Неоднозначные рёбра (фигура не найдена
    или несколько наложенных кандидатов) помечаются `needs_review: true`.
+   Мелкие изолированные фигуры-подписи рядом с линией (например, «таблетка»
+   `https, kafka (mtls)` возле стрелки) приклеиваются к ребру как его подпись,
+   а не остаются отдельными узлами без связей.
 2. **Семантический** — только помеченные рёбра Claude разбирает по подписям
    ребра и узлов-кандидатов по правилам из
    [`references/semantic_resolution_prompt.md`](.claude/skills/drawio-to-mermaid/references/semantic_resolution_prompt.md);
@@ -237,6 +240,8 @@ Claude Code подхватывает скилл в новой сессии и в
 python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio              # mermaid в stdout
 python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio --format json -o graph.json
 python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio --threshold 40 --debug
+python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio --annotation-threshold 60   # подписи дальше от линий
+python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio --no-absorb-labels         # без приклеивания подписей
 ```
 
 Ограничения: многостраничные диаграммы и фигуры внутри групп/контейнеров
