@@ -1,10 +1,11 @@
 # hooks-for-llm
 
-Репозиторий содержит два независимых набора инструментов:
+Репозиторий содержит три независимых набора инструментов:
 
 1. **Shunt-хуки для Claude Code** — bash/jq-хуки, ограничивающие контекст.
 2. **Инструменты проекта Digital Accounting** — Python/Node-утилиты для
    извлечения и синхронизации данных.
+3. **Скиллы Claude Code** — готовые к копированию папки `.claude/skills/<name>/`.
 
 ---
 
@@ -195,3 +196,49 @@ Node-инструменты там, где нужная экосистема —
   пакет локально). Используется при любой правке диаграмм в `diagrams/`,
   включая создание диаграмм модели данных (`erDiagram`), не только
   `flowchart`.
+
+---
+
+## 3. Скиллы Claude Code
+
+Скиллы лежат в [`.claude/skills/`](.claude/skills/) — в этом репозитории они
+сразу доступны Claude Code, а в свой проект их достаточно скопировать целой папкой:
+
+```bash
+mkdir -p .claude/skills
+cp -r <путь-к-hooks-for-llm>/.claude/skills/drawio-to-mermaid .claude/skills/
+```
+
+Чтобы скилл был доступен во всех проектах — копируйте в `~/.claude/skills/`.
+Claude Code подхватывает скилл в новой сессии и вызывает его сам по описанию
+из `SKILL.md`; вручную — `/drawio-to-mermaid`.
+
+### 3.1. drawio-to-mermaid
+
+Переводит `.drawio`-диаграмму в Mermaid `flowchart` в два прохода:
+
+1. **Геометрический** — скрипт
+   [`scripts/drawio_to_mermaid.py`](.claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py)
+   читает drawio (открытый XML или сжатый base64+deflate), берёт formal
+   `source`/`target` как есть, а для стрелок, которые автор лишь подвёл к фигуре,
+   ищет ближайшую фигуру по координатам. Неоднозначные рёбра (фигура не найдена
+   или несколько наложенных кандидатов) помечаются `needs_review: true`.
+2. **Семантический** — только помеченные рёбра Claude разбирает по подписям
+   ребра и узлов-кандидатов по правилам из
+   [`references/semantic_resolution_prompt.md`](.claude/skills/drawio-to-mermaid/references/semantic_resolution_prompt.md);
+   неуверенные решения остаются в итоговом mermaid с пометкой
+   `%% requires manual review`.
+
+Требования: Python 3.10+ (без сторонних пакетов), `jq` — по желанию.
+
+Скрипт можно запускать и без Claude:
+
+```bash
+python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio              # mermaid в stdout
+python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio --format json -o graph.json
+python .claude/skills/drawio-to-mermaid/scripts/drawio_to_mermaid.py diagram.drawio --threshold 40 --debug
+```
+
+Ограничения: многостраничные диаграммы и фигуры внутри групп/контейнеров
+(у них относительные координаты) обрабатываются неточно — подробности в
+[`SKILL.md`](.claude/skills/drawio-to-mermaid/SKILL.md).
