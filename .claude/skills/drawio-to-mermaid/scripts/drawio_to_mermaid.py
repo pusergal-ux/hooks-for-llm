@@ -7,21 +7,36 @@ drawio_to_mermaid.py
 Задача: в отличие от drawio-digest и подобных структурных парсеров,
 которые читают ТОЛЬКО formal source/target у mxCell, этот скрипт
 дополнительно резолвит стрелки, у которых нет formal-привязки к
-фигурам (архитектор визуально подвёл линию, но не "приклеил" её
-в drawio), используя эвристику по координатам:
+фигурам, используя две отдельные эвристики:
 
-  1. Если у ребра есть source/target -> используем как есть (надёжно).
-  2. Если source/target нет -> берём geometry-точки конца линии
-     (mxPoint as="sourcePoint"/"targetPoint") и ищем ближайшую
-     фигуру (vertex) по расстоянию от точки до bounding box.
-  3. При наложении нескольких фигур-кандидатов на одной позиции -
-     приоритет отдаётся последней по порядку в XML (обычно то,
-     что нарисовано позже, визуально наверху и вероятнее то,
-     к чему "прицеливался" автор стрелки).
+  ЭВРИСТИКА 1 — привязка концов линии к фигурам (для рёбер вообще
+  без formal source/target):
+    Если у ребра есть source/target -> используем как есть (надёжно).
+    Если нет -> берём geometry-точки конца линии (mxPoint
+    as="sourcePoint"/"targetPoint") и ищем ближайшую фигуру (vertex)
+    по расстоянию от точки до bounding box. При наложении нескольких
+    фигур-кандидатов на одной позиции — приоритет отдаётся последней
+    по порядку в XML (обычно то, что нарисовано позже, визуально
+    наверху).
+
+  ЭВРИСТИКА 2 — "прилипание" плавающих подписей к линии (для случая,
+  когда автор диаграммы разместил рядом со стрелкой отдельную мелкую
+  фигуру-подпись — например, "https, kafka (mtls)" или "NFS" в виде
+  скруглённой "таблетки" — визуально рядом с линией, но НЕ как formal
+  label этого edge и без всякой связи с другими фигурами). Такие
+  фигуры никогда не выступают source/target ни одного ребра — они
+  остаются полностью изолированными узлами графа. Скрипт находит все
+  изолированные небольшие фигуры (площадь ниже --annotation-max-area)
+  и, если фигура физически лежит близко (--annotation-threshold px)
+  к линии (полилинии) какого-то ребра, "прикрепляет" её текст как
+  дополнительную подпись этого ребра вместо того, чтобы рисовать её
+  отдельным несвязанным узлом в mermaid.
 
 Использование:
     python3 drawio_to_mermaid.py diagram.drawio
     python3 drawio_to_mermaid.py diagram.drawio --threshold 40
+    python3 drawio_to_mermaid.py diagram.drawio --annotation-threshold 25
+    python3 drawio_to_mermaid.py diagram.drawio --no-absorb-labels
     python3 drawio_to_mermaid.py diagram.drawio --format json
     python3 drawio_to_mermaid.py diagram.drawio --debug   # печатает эвристические решения
 
@@ -56,6 +71,8 @@ class Shape:
     w: float
     h: float
     order: int  # позиция в XML — для z-order эвристики
+    absorbed_into: str | None = None  # id ребра, к которому "прилипла" эта подпись
+    absorbed_distance: float | None = None
 
     @property
     def x2(self):
@@ -72,6 +89,10 @@ class Shape:
     @property
     def cy(self):
         return self.y + self.h / 2
+
+    @property
+    def area(self):
+        return self.w * self.h
 
     def distance_to_point(self, px, py):
         """Расстояние от точки до ближайшей границы bounding box.
@@ -93,6 +114,7 @@ class Edge:
     target_id: str | None
     source_point: tuple | None = None  # (x, y) — если нет formal source
     target_point: tuple | None = None
+    waypoints: list = field(default_factory=list)  # промежуточные точки маршрута линии
     resolved_source: str | None = field(default=None)
     resolved_target: str | None = field(default=None)
     resolution_note: str = ""  # для --debug
@@ -104,6 +126,9 @@ class Edge:
     target_candidates: list = field(default_factory=list)
     source_overlap: bool = False  # True если у этой точки было наложение (tie по расстоянию)
     target_overlap: bool = False
+    # Подписи, "прилипшие" к этому ребру эвристикой 2 (плавающие фигуры
+    # рядом с линией). Каждый элемент: {"shape_id", "label", "distance"}.
+    annotations: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -174,6 +199,7 @@ def parse_shapes_and_edges(root: ET.Element):
             source_id = cell.get("source")
             target_id = cell.get("target")
             source_point = target_point = None
+            waypoints = []
 
             if geom is not None:
                 sp = geom.find("mxPoint[@as='sourcePoint']")
@@ -183,6 +209,13 @@ def parse_shapes_and_edges(root: ET.Element):
                 if tp is not None:
                     target_point = (float(tp.get("x", 0)), float(tp.get("y", 0)))
 
+                # промежуточные точки маршрута (изгибы ортогональной линии) —
+                # хранятся в <Array as="points"><mxPoint .../>...</Array>
+                points_array = geom.find("Array[@as='points']")
+                if points_array is not None:
+                    for pt in points_array.findall("mxPoint"):
+                        waypoints.append((float(pt.get("x", 0)), float(pt.get("y", 0))))
+
             edges.append(Edge(
                 id=cell_id,
                 label=value,
@@ -190,6 +223,7 @@ def parse_shapes_and_edges(root: ET.Element):
                 target_id=target_id,
                 source_point=source_point,
                 target_point=target_point,
+                waypoints=waypoints,
             ))
 
     return shapes, edges
@@ -311,6 +345,118 @@ def resolve_edges(shapes: dict, edges: list, threshold: float, debug: bool):
 
 
 # --------------------------------------------------------------------------
+# Эвристика 2: "прилипание" плавающих подписей к линии ребра
+# --------------------------------------------------------------------------
+
+def point_to_segment_distance(px, py, x1, y1, x2, y2):
+    """Расстояние от точки (px,py) до отрезка (x1,y1)-(x2,y2)."""
+    dx, dy = x2 - x1, y2 - y1
+    if dx == 0 and dy == 0:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    t = ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return ((px - proj_x) ** 2 + (py - proj_y) ** 2) ** 0.5
+
+
+def build_edge_polyline(edge: "Edge", shapes: dict):
+    """Собирает полилинию ребра: [начало] + waypoints + [конец].
+    Если явных geometry-точек нет, использует центр резолвленной
+    фигуры-эндпоинта как приближение. Возвращает список (x,y) точек
+    либо [] если построить нечего (меньше 2 точек)."""
+    points = []
+
+    if edge.source_point is not None:
+        points.append(edge.source_point)
+    elif edge.resolved_source and edge.resolved_source in shapes:
+        s = shapes[edge.resolved_source]
+        points.append((s.cx, s.cy))
+
+    points.extend(edge.waypoints)
+
+    if edge.target_point is not None:
+        points.append(edge.target_point)
+    elif edge.resolved_target and edge.resolved_target in shapes:
+        t = shapes[edge.resolved_target]
+        points.append((t.cx, t.cy))
+
+    return points if len(points) >= 2 else []
+
+
+def distance_point_to_polyline(px, py, polyline):
+    """Минимальное расстояние от точки до ближайшего отрезка полилинии."""
+    best = float("inf")
+    for i in range(len(polyline) - 1):
+        x1, y1 = polyline[i]
+        x2, y2 = polyline[i + 1]
+        d = point_to_segment_distance(px, py, x1, y1, x2, y2)
+        best = min(best, d)
+    return best
+
+
+def absorb_floating_labels(shapes: dict, edges: list, annotation_threshold: float,
+                            annotation_max_area: float, debug: bool):
+    """Изолированные небольшие фигуры (не участвующие ни в одном ребре
+    как source/target), лежащие близко к линии какого-то ребра,
+    трактуются как плавающая подпись этого ребра, а не отдельный узел
+    графа. Типичный кейс: скруглённая "таблетка" с текстом протокола
+    ("https, kafka (mtls)", "NFS"), просто визуально положенная рядом
+    со стрелкой автором диаграммы, без formal-связи с чем-либо."""
+
+    connected_ids = set()
+    for e in edges:
+        if e.resolved_source:
+            connected_ids.add(e.resolved_source)
+        if e.resolved_target:
+            connected_ids.add(e.resolved_target)
+
+    # предварительно считаем полилинии всех рёбер один раз
+    edge_polylines = {e.id: build_edge_polyline(e, shapes) for e in edges}
+    edges_by_id = {e.id: e for e in edges}
+
+    debug_notes = []
+    absorbed_count = 0
+
+    for shape in shapes.values():
+        if shape.id in connected_ids:
+            continue  # это полноценный узел графа, не трогаем
+        if shape.area > annotation_max_area:
+            continue  # слишком большая фигура, чтобы быть просто подписью
+        if not shape.label:
+            continue  # нечего прикреплять — пустая подпись
+
+        best_edge_id = None
+        best_distance = float("inf")
+        for edge_id, polyline in edge_polylines.items():
+            if not polyline:
+                continue
+            d = distance_point_to_polyline(shape.cx, shape.cy, polyline)
+            if d < best_distance:
+                best_distance = d
+                best_edge_id = edge_id
+
+        if best_edge_id is not None and best_distance <= annotation_threshold:
+            shape.absorbed_into = best_edge_id
+            shape.absorbed_distance = round(best_distance, 1)
+            edges_by_id[best_edge_id].annotations.append({
+                "shape_id": shape.id,
+                "label": shape.label,
+                "distance": round(best_distance, 1),
+            })
+            absorbed_count += 1
+            debug_notes.append(
+                f"  '{shape.label}' (id={shape.id}) прилип к ребру "
+                f"{best_edge_id} (дистанция {best_distance:.1f}px)"
+            )
+
+    if debug and debug_notes:
+        print(f"--- Прилипание плавающих подписей ({absorbed_count}) ---", file=sys.stderr)
+        for note in debug_notes:
+            print(note, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
 # Вывод
 # --------------------------------------------------------------------------
 
@@ -329,7 +475,7 @@ def render_mermaid(shapes: dict, edges: list) -> str:
             used_shape_ids.add(edge.resolved_target)
 
     # объявляем узлы (только те, что реально участвуют в связях —
-    # изолированные декоративные фигуры пропускаем)
+    # изолированные декоративные фигуры и "прилипшие" подписи пропускаем)
     for shape_id in used_shape_ids:
         shape = shapes[shape_id]
         label = shape.label.replace('"', "'") or shape.id
@@ -340,8 +486,16 @@ def render_mermaid(shapes: dict, edges: list) -> str:
             continue
         src = to_mermaid_id(edge.resolved_source)
         tgt = to_mermaid_id(edge.resolved_target)
+
+        # объединяем formal label ребра с "прилипшими" плавающими подписями
+        label_parts = []
         if edge.label:
-            safe_label = edge.label.replace('"', "'")
+            label_parts.append(edge.label)
+        label_parts.extend(a["label"] for a in edge.annotations)
+        full_label = ", ".join(label_parts)
+
+        if full_label:
+            safe_label = full_label.replace('"', "'")
             lines.append(f'    {src} -->|"{safe_label}"| {tgt}')
         else:
             lines.append(f"    {src} --> {tgt}")
@@ -359,6 +513,8 @@ def render_json(shapes: dict, edges: list) -> str:
             "target": e.resolved_target,
             "resolution": e.resolution_note,
         }
+        if e.annotations:
+            item["annotations"] = e.annotations
         # Кандидаты добавляем только там, где резолюция шла через
         # геометрию (heuristic/unresolved) — для formal-рёбер они
         # не считались и не нужны (там уже есть надёжный source/target).
@@ -382,13 +538,15 @@ def render_json(shapes: dict, edges: list) -> str:
             )
         edges_out.append(item)
 
-    data = {
-        "nodes": [
-            {"id": s.id, "label": s.label, "x": s.x, "y": s.y, "w": s.w, "h": s.h}
-            for s in shapes.values()
-        ],
-        "edges": edges_out,
-    }
+    nodes_out = []
+    for s in shapes.values():
+        node = {"id": s.id, "label": s.label, "x": s.x, "y": s.y, "w": s.w, "h": s.h}
+        if s.absorbed_into:
+            node["absorbed_into_edge"] = s.absorbed_into
+            node["absorbed_distance"] = s.absorbed_distance
+        nodes_out.append(node)
+
+    data = {"nodes": nodes_out, "edges": edges_out}
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
@@ -397,14 +555,20 @@ def render_json(shapes: dict, edges: list) -> str:
 # --------------------------------------------------------------------------
 
 def main():
-    # консоль Windows по умолчанию не UTF-8 — кириллица в выводе ломается
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
-
-    parser =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("drawio_file", help="Путь к .drawio/.xml файлу")
     parser.add_argument("--threshold", type=float, default=30.0,
                          help="Радиус поиска ближайшей фигуры к концу несвязанной линии, px (по умолчанию 30)")
+    parser.add_argument("--annotation-threshold", type=float, default=40.0,
+                         help="Макс. расстояние от плавающей подписи до линии ребра, "
+                              "чтобы считать её подписью этого ребра, px (по умолчанию 40)")
+    parser.add_argument("--annotation-max-area", type=float, default=8000.0,
+                         help="Макс. площадь (w*h) фигуры, чтобы считать её кандидатом "
+                              "в плавающую подпись, а не полноценным узлом (по умолчанию 8000, "
+                              "т.е. примерно 100x80px)")
+    parser.add_argument("--no-absorb-labels", action="store_true",
+                         help="Отключить эвристику 2 (прилипание плавающих подписей к линиям) — "
+                              "изолированные мелкие фигуры останутся отдельными несвязанными узлами")
     parser.add_argument("--format", choices=["mermaid", "json"], default="mermaid",
                          help="Формат вывода (по умолчанию mermaid)")
     parser.add_argument("--debug", action="store_true",
@@ -415,6 +579,10 @@ def main():
     root = load_xml_root(args.drawio_file)
     shapes, edges = parse_shapes_and_edges(root)
     unresolved = resolve_edges(shapes, edges, args.threshold, args.debug)
+
+    if not args.no_absorb_labels:
+        absorb_floating_labels(
+            shapes, edges, args.annotation_threshold, args.annotation_max_area, args.debug)
 
     if args.format == "mermaid":
         output = render_mermaid(shapes, edges)
